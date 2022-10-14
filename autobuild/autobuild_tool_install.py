@@ -12,12 +12,17 @@ import http.client
 import logging
 import os
 import pprint
+import shutil
 import sys
 import tarfile
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from contextlib import contextmanager
+from importlib.metadata import PackageMetadata
+from pathlib import Path
 
 from autobuild import autobuild_base, common, configfile, hash_algorithms
 from autobuild.autobuild_tool_source_environment import get_enriched_environment
@@ -295,80 +300,6 @@ def get_package_file(package_name, package_url, hash_algorithm='md5', expected_h
 
     return cache_file
 
-def _install_package(archive_path, install_dir, exclude=[]):
-    """
-    Install the archive at the provided path into the given installation directory.  Returns the
-    list of files that were installed.
-    """
-    if not os.path.exists(archive_path):
-        logger.error("cannot extract non-existing package: %s" % archive_path)
-        return False
-    logger.info("extracting from %s" % os.path.basename(archive_path))
-    if tarfile.is_tarfile(archive_path) or ".tar.zst" in archive_path:
-        return __extract_tar_file(archive_path, install_dir, exclude=exclude)
-    elif zipfile.is_zipfile(archive_path):
-        return __extract_zip_archive(archive_path, install_dir, exclude=exclude)
-    else:
-        logger.error("package %s is not archived in a supported format" % archive_path)
-        return False
-
-
-def extract_metadata_from_package(archive_path, metadata_file_name):
-    """
-    Get the package metadata from the archive
-    """
-    metadata_file = None
-    if not os.path.exists(archive_path):
-        logger.error("no package found at: %s" % archive_path)
-    else:
-        logger.debug("extracting metadata from %s" % os.path.basename(archive_path))
-        if tarfile.is_tarfile(archive_path) or ".tar.zst" in archive_path:
-            if ".tar.zst" in archive_path:
-                tar = common.ZstdTarFile(archive_path, 'r')
-            else:
-                tar = tarfile.open(archive_path, 'r')
-            try:
-                metadata_file = tar.extractfile(metadata_file_name)
-            except KeyError as err:
-                metadata_file = None
-                pass  # returning None will indicate that it was not there
-        elif zipfile.is_zipfile(archive_path):
-            try:
-                zip = zipfile.ZipFile(archive_path, 'r')
-                metadata_file = zip.open(metadata_file_name, 'r')
-            except KeyError as err:
-                metadata_file = None
-                pass  # returning None will indicate that it was not there
-        else:
-            logger.error("package %s is not archived in a supported format" % archive_path)
-    return metadata_file
-
-def __extract_tar_file(cachename, install_dir, exclude=[]):
-    # Attempt to extract the package from the install cache
-    if ".tar.zst" in cachename:
-        tar = common.ZstdTarFile(cachename, 'r')
-    else:
-        tar = tarfile.open(cachename, 'r')
-    extract = [member for member in tar.getmembers() if member.name not in exclude]
-    conflicts = [member.name for member in extract
-                 if os.path.exists(os.path.join(install_dir, member.name))
-                 and not os.path.isdir(os.path.join(install_dir, member.name))]
-    if conflicts:
-        raise common.AutobuildError("conflicting files:\n  "+'\n  '.join(conflicts))
-    tar.extractall(path=install_dir, members=extract)
-    return [member.name for member in extract]
-
-
-def __extract_zip_archive(cachename, install_dir, exclude=[]):
-    zip_archive = zipfile.ZipFile(cachename, 'r')
-    extract = [member for member in zip_archive.namelist() if member not in exclude]
-    conflicts = [member for member in extract
-                 if os.path.exists(os.path.join(install_dir, member))
-                 and not os.path.isdir(os.path.join(install_dir, member))]
-    if conflicts:
-        raise common.AutobuildError("conflicting files:\n  "+'\n  '.join(conflicts))
-    zip_archive.extractall(path=install_dir, members=extract)
-    return extract
 
 def do_install(packages, config_file, installed, platform, install_dir, dry_run, local_archives=[]):
     """
@@ -473,36 +404,11 @@ def _install_binary(configured_name, platform, package, config_file, install_dir
     else:
         return False
 
+
 def get_metadata_from_package(package_file, package=None):
-    metadata_file_name = configfile.PACKAGE_METADATA_FILE
-    metadata_file = extract_metadata_from_package(package_file, metadata_file_name)
-    if not metadata_file:
-        logger.warning("WARNING: Archive '%s' does not contain metadata; build will be marked as dirty"
-                       % os.path.basename(package_file))
-        # Create a dummy metadata description for a package whose archive does not have one
-        metadata = configfile.MetadataDescription()
-        # split_tarname() returns a sequence like:
-        # ("/some/path", ["boost", "1.39.0", "darwin", "20100222a"], ".tar.bz2")
-        ignore_dir, from_name, ignore_ext = common.split_tarname(package_file)
-        metadata.platform = from_name[2]
-        metadata.build_id = from_name[3]
-        metadata.configuration = 'unknown'
-        if package is not None:
-            if from_name[0] != package.name:
-                raise InstallError("configured package name '%s' does not match name from archive '%s'" \
-                                   % (package.name, from_name[0]))
-            metadata.archive = package['platforms'][metadata.platform]['archive']
-            metadata.package_description = package.copy()
-        else:
-            metadata.archive = configfile.ArchiveDescription()
-            metadata.package_description = configfile.PackageDescription({})
-        metadata.package_description.version = from_name[1]
-        metadata.package_description.name = from_name[0]
-        del metadata.package_description['platforms']
-        metadata.dirty = True
-    else:
-        metadata = configfile.MetadataDescription(stream=metadata_file)
-    return metadata
+    with open_package(package_file) as pending:
+        return pending.metadata() or _default_metadata_for_package(package_file, package)
+
 
 def install_new_if_needed(package, metadata, installed, dry_run):
     """
@@ -534,27 +440,129 @@ def install_new_if_needed(package, metadata, installed, dry_run):
         do_install = True
     return do_install
 
+
+class PendingPackage:
+    """An extracted but uninstalled package"""
+    def __init__(self, dir: str):
+        self._dir = dir
+
+    def metadata(self) -> PackageMetadata | None:
+        """Read package metadata file"""
+        try:
+            with open(os.path.join(self._dir, configfile.PACKAGE_METADATA_FILE), "rb") as f:
+                return configfile.MetadataDescription(stream=f)
+        except FileNotFoundError:
+            return None
+
+    def install(self, dst: str) -> list[str]:
+        """Copy package contents to dst, raising and error if there are file conflicts"""
+        exclude = {configfile.PACKAGE_METADATA_FILE,}
+        conflicts = []
+        installed_files = []
+        for root, dirs, files in os.walk(self._dir):
+            # Check for conflicts
+            for name in files:
+                relpath = os.path.relpath(os.path.join(root, name), self._dir)
+                if relpath in exclude:
+                    pass
+                elif os.path.exists(os.path.join(dst, relpath)):
+                    conflicts.append(os.path.join(dst, name))
+
+            if conflicts:
+                raise common.AutobuildError("conflicting files:\n " + "\n  ".join(conflicts))
+
+            # Create directories
+            for name in dirs:
+                relpath = os.path.relpath(os.path.join(root, name), self._dir)
+                dstpath = os.path.join(dst, relpath)
+                if not os.path.exists(dstpath):
+                    os.mkdir(dstpath)
+
+            # Copy files
+            for name in files:
+                relpath = os.path.relpath(os.path.join(root, name), self._dir)
+                if relpath in exclude:
+                    pass
+                else:
+                    installed_files.append(relpath)
+                    shutil.copy2(os.path.join(root, name), os.path.join(dst, relpath))
+
+        return installed_files
+
+
+def _default_metadata_for_package(package_file: str, package = None):
+    logger.warning("WARNING: Archive '%s' does not contain metadata; build will be marked as dirty"
+                    % os.path.basename(package_file))
+    # Create a dummy metadata description for a package whose archive does not have one
+    metadata = configfile.MetadataDescription()
+    # split_tarname() returns a sequence like:
+    # ("/some/path", ["boost", "1.39.0", "darwin", "20100222a"], ".tar.bz2")
+    ignore_dir, from_name, ignore_ext = common.split_tarname(package_file)
+    metadata.platform = from_name[2]
+    metadata.build_id = from_name[3]
+    metadata.configuration = 'unknown'
+    if package is not None:
+        if from_name[0] != package.name:
+            raise InstallError("configured package name '%s' does not match name from archive '%s'" \
+                                % (package.name, from_name[0]))
+        metadata.archive = package['platforms'][metadata.platform]['archive']
+        metadata.package_description = package.copy()
+    else:
+        metadata.archive = configfile.ArchiveDescription()
+        metadata.package_description = configfile.PackageDescription({})
+    metadata.package_description.version = from_name[1]
+    metadata.package_description.name = from_name[0]
+    del metadata.package_description['platforms']
+    metadata.dirty = True
+    return metadata
+
+
+def open_archive(filename: str) -> tarfile.TarFile | zipfile.ZipFile:
+    if filename.endswith(".tar.zst"):
+        return common.ZstdTarFile(filename, "r")
+    elif filename.endswith(".zip"):
+        return zipfile.ZipFile(filename, "r")
+    else:
+        return tarfile.open(filename, "r")
+
+
+@contextmanager
+def open_package(package_file: str):
+    """
+    Open and yield a PendingPackage, which can be installed into a destination folder or inspected.
+
+    This is done because the act of searching for a package-metadata.xml file is often as expensive
+    as extracting the entire package.
+    """
+    with tempfile.TemporaryDirectory() as dir:
+        with open_archive(package_file) as archive:
+            archive.extractall(dir)
+        yield PendingPackage(dir)
+
+
 def _install_common(configured_name, platform, package, package_file, install_dir, installed, dry_run):
+    with open_package(package_file) as pending:
+        metadata = pending.metadata()
+        if metadata is None:
+            metadata = _default_metadata_for_package(package_file, package)
 
-    metadata = get_metadata_from_package(package_file, package)
+        # Check for required package_description elements
+        package_errors = configfile.check_package_attributes(metadata, additional_requirements=['version'])
+        if package_errors:
+            logger.warning(package_errors + "\n    in package %s\n    build will be marked as 'dirty'" % package.name)
+            metadata.dirty = True
 
-    # Check for required package_description elements
-    package_errors = configfile.check_package_attributes(metadata, additional_requirements=['version'])
-    if package_errors:
-        logger.warning(package_errors + "\n    in package %s\n    build will be marked as 'dirty'" % package.name)
-        metadata.dirty = True
+        if configured_name != package.name:
+            raise InstallError("Configured package name '%s' does not match name in package '%s'" % (configured_name, package.name))
 
-    if configured_name != package.name:
-        raise InstallError("Configured package name '%s' does not match name in package '%s'" % (configured_name, package.name))
-
-    # this checks for a different version and uninstalls it if needed
-    if not install_new_if_needed(package, metadata, installed, dry_run):
-        logger.info("%s is already installed" % package.name)
-        return None, None
-    # Check for transitive dependency conflicts
-    dependancy_conflicts = transitive_search(metadata, installed)
-    if dependancy_conflicts:
-        raise InstallError("""Package not installable due to conflicts
+        # this checks for a different version and uninstalls it if needed
+        if not install_new_if_needed(package, metadata, installed, dry_run):
+            logger.info("%s is already installed" % package.name)
+            return None, None
+        # Check for transitive dependency conflicts
+        dependancy_conflicts = transitive_search(metadata, installed)
+        if dependancy_conflicts:
+            raise InstallError("""Package not installable due to conflicts
 %s
   configuration %s
   version       %s
@@ -569,44 +577,44 @@ Conflict: %s
    dependancy_conflicts
    ))
 
-    # check that the install dir exists...
-    if not os.path.exists(install_dir):
+        # check that the install dir exists...
+        if not os.path.exists(install_dir):
+            if not dry_run:
+                logger.debug("creating " + install_dir)
+                os.makedirs(install_dir)
+            else:
+                logger.debug("would have created " + install_dir)
+
         if not dry_run:
-            logger.debug("creating " + install_dir)
-            os.makedirs(install_dir)
+            logger.info("installing %s" % package.name)
         else:
-            logger.debug("would have created " + install_dir)
+            logger.info("would have attempted install of %s" % package.name)
+            return None,None
 
-    if not dry_run:
-        logger.info("installing %s" % package.name)
-    else:
-        logger.info("would have attempted install of %s" % package.name)
-        return None,None
+        # extract the files from the package
+        try:
+            files = pending.install(install_dir)
+        except common.AutobuildError as details:
+            raise InstallError("Package '%s' attempts to install files already installed.\n%s\n  use --what-installed <file> to find the package that installed a conflict" % (package.name, details))
+        if files:
+            for f in files:
+                logger.debug("    extracted " + f)
 
-    # extract the files from the package
-    try:
-        files = _install_package(package_file, install_dir, exclude=[configfile.PACKAGE_METADATA_FILE])
-    except common.AutobuildError as details:
-        raise InstallError("Package '%s' attempts to install files already installed.\n%s\n  use --what-installed <file> to find the package that installed a conflict" % (package.name, details))
-    if files:
-        for f in files:
-            logger.debug("    extracted " + f)
+        # Prefer the licence attribute and license file location from the metadata,
+        # but for backward compatibility with legacy packages, allow use of the attributes
+        # in the installable description (which are otherwise not required)
+        if not ( metadata.package_description.get('license') or package.license ):
+            clean_files(install_dir, files) # clean up any partial install
+            raise InstallError("no license specified in metadata or configuration for %s." % package.name)
 
-    # Prefer the licence attribute and license file location from the metadata,
-    # but for backward compatibility with legacy packages, allow use of the attributes
-    # in the installable description (which are otherwise not required)
-    if not ( metadata.package_description.get('license') or package.license ):
-        clean_files(install_dir, files) # clean up any partial install
-        raise InstallError("no license specified in metadata or configuration for %s." % package.name)
-
-    license_file = metadata.package_description.get('license_file') or package.license_file
-    if license_file is None \
-      or not (license_file in files \
-              or license_file.startswith('http://') \
-              or license_file.startswith('https://') \
-              ):
-        clean_files(install_dir, files) # clean up any partial install
-        raise InstallError("nonexistent license_file for %s: %s" % (package.name, license_file))
+        license_file = metadata.package_description.get('license_file') or package.license_file
+        if license_file is None \
+        or not (license_file in files \
+                or license_file.startswith('http://') \
+                or license_file.startswith('https://') \
+                ):
+            clean_files(install_dir, files) # clean up any partial install
+            raise InstallError("nonexistent license_file for %s: %s" % (package.name, license_file))
 
     return metadata, files
 
@@ -797,7 +805,10 @@ def install_packages(args, config_file, install_dir, platform, packages):
     local_archives = {}
     for archive_path in args.local_archives:
         logger.info("Checking local archive '%s'" % archive_path)
-        local_metadata = get_metadata_from_package(archive_path)
+        with open_package(archive_path) as pending:
+            local_metadata = pending.metadata()
+            if local_metadata is None:
+                local_metadata = _default_metadata_for_package(archive_path)
         if local_metadata.package_description.name in local_packages:
             packages.append(local_metadata.package_description.name)
         if local_metadata.package_description.name in packages:
