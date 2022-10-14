@@ -332,6 +332,7 @@ def extract_metadata_from_package(archive_path, metadata_file_name):
             except KeyError as err:
                 metadata_file = None
                 pass  # returning None will indicate that it was not there
+            tar.close()
         elif zipfile.is_zipfile(archive_path):
             try:
                 zip = zipfile.ZipFile(archive_path, 'r')
@@ -344,20 +345,31 @@ def extract_metadata_from_package(archive_path, metadata_file_name):
     return metadata_file
 
 def __extract_tar_file(cachename, install_dir, exclude=[]):
+    logger.debug(f"extracting {cachename}")
+
     # Attempt to extract the package from the install cache
     if ".tar.zst" in cachename:
         tar = common.ZstdTarFile(cachename, 'r')
     else:
         tar = tarfile.open(cachename, 'r')
-    extract = [member for member in tar.getmembers() if member.name not in exclude]
-    conflicts = [member.name for member in extract
-                 if os.path.exists(os.path.join(install_dir, member.name))
-                 and not os.path.isdir(os.path.join(install_dir, member.name))]
-    if conflicts:
-        raise common.AutobuildError("conflicting files:\n  "+'\n  '.join(conflicts))
-    tar.extractall(path=install_dir, members=extract)
-    return [member.name for member in extract]
 
+    extracted = []
+    conflicts = []
+
+    for t in tar:
+        if t.name in exclude:
+            continue
+        if os.path.exists(os.path.join(install_dir, t.name)) and not os.path.isdir(os.path.join(install_dir, t.name)):
+            conflicts.append(t.name)
+        tar.extractfile(t)
+        extracted.append(t.name)
+
+    tar.close()
+
+    if conflicts:
+        raise common.AutobuildError('conflicting files: ' + '\n  '.join(conflicts))
+
+    return extracted
 
 def __extract_zip_archive(cachename, install_dir, exclude=[]):
     zip_archive = zipfile.ZipFile(cachename, 'r')
